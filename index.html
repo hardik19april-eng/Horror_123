@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Last Wick</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+html,body{margin:0;height:100%;background:#000;overflow:hidden}
+canvas{display:block}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+// ================= LAST WICK =================
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+const dk = document.createElement('canvas'), dctx = dk.getContext('2d');
+let cw, ch;
+function resize(){ cw = cv.width = dk.width = innerWidth; ch = cv.height = dk.height = innerHeight; }
+addEventListener('resize', resize); resize();
+
+const TS = 48, CW = 15, CH = 11, W = CW*2+1, H = CH*2+1, NEED = 5;
+const D = [[1,0],[-1,0],[0,1],[0,-1]];
+let map, P, E, candles, oils, exit, state = 'title', time = 0, shake = 0, grace = 0;
+let dP = null, lastPT = '', thinkT = 0, patrolMap = null, deadT = 0, msg = '', msgT = 0;
+const keys = {};
+
+// ---------- sound ----------
+let AC = null, drone = null;
+function initAudio(){
+  if(AC) return;
+  try{
+    AC = new (window.AudioContext || window.webkitAudioContext)();
+    drone = [50, 53.5].map(f => {
+      const o = AC.createOscillator(), g = AC.createGain();
+      o.type = 'sawtooth'; o.frequency.value = f; g.gain.value = .025;
+      const lp = AC.createBiquadFilter(); lp.frequency.value = 160;
+      o.connect(lp); lp.connect(g); g.connect(AC.destination); o.start(); return g;
+    });
+  }catch(e){}
+}
+function tone(f, d, v, type='sine'){
+  if(!AC) return;
+  const o = AC.createOscillator(), g = AC.createGain();
+  o.type = type; o.frequency.value = f;
+  g.gain.setValueAtTime(v, AC.currentTime);
+  g.gain.exponentialRampToValueAtTime(.001, AC.currentTime + d);
+  o.connect(g); g.connect(AC.destination); o.start(); o.stop(AC.currentTime + d);
+}
+function scream(){
+  for(let i = 0; i < 6; i++) tone(300 + Math.random()*900, .9, .25, 'sawtooth');
+  tone(60, 1.2, .5, 'square');
+}
+
+// ---------- maze ----------
+function gen(){
+  map = Array.from({length:H}, () => Array(W).fill(1));
+  const seen = new Set(['0,0']), st = [[0,0]]; map[1][1] = 0;
+  while(st.length){
+    const [x,y] = st[st.length-1];
+    const nb = D.map(([a,b]) => [x+a, y+b]).filter(([a,b]) => a>=0 && b>=0 && a<CW && b<CH && !seen.has(a+','+b));
+    if(!nb.length){ st.pop(); continue; }
+    const [a,b] = nb[Math.random()*nb.length|0];
+    seen.add(a+','+b); map[2*b+1][2*a+1] = 0; map[y+b+1][x+a+1] = 0; st.push([a,b]);
+  }
+  for(let i = 0; i < 30; i++){
+    const x = 1 + (Math.random()*(W-2)|0), y = 1 + (Math.random()*(H-2)|0);
+    if(map[y][x] === 1 && ((x%2 && !(y%2)) || (!(x%2) && y%2))) map[y][x] = 0;
+  }
+}
+function dmap(tx, ty){
+  const d = Array.from({length:H}, () => Array(W).fill(-1)), q = [[tx,ty]]; d[ty][tx] = 0;
+  for(let i = 0; i < q.length; i++){
+    const [x,y] = q[i];
+    for(const [a,b] of D){
+      const nx = x+a, ny = y+b;
+      if(map[ny] && map[ny][nx] === 0 && d[ny][nx] < 0){ d[ny][nx] = d[y][x] + 1; q.push([nx,ny]); }
+    }
+  }
+  return d;
+}
+const solid = (px, py) => { const x = px/TS|0, y = py/TS|0; return !map[y] || map[y][x] !== 0; };
+const rndFloor = (d, minD) => {
+  for(;;){
+    const x = 1 + (Math.random()*(W-2)|0), y = 1 + (Math.random()*(H-2)|0);
+    if(map[y][x] === 0 && d[y][x] >= minD) return [x,y];
+  }
+};
+
+// ---------- setup ----------
+function newGame(){
+  gen();
+  const d0 = dmap(1,1);
+  P = {x:1.5*TS, y:1.5*TS, r:12, oil:1, stam:1, tired:false, moving:false, running:false};
+  candles = []; oils = [];
+  for(let i = 0; i < NEED; i++){ const [x,y] = rndFloor(d0, 10); candles.push({x:(x+.5)*TS, y:(y+.5)*TS, got:false}); }
+  for(let i = 0; i < 5; i++){ const [x,y] = rndFloor(d0, 6); oils.push({x:(x+.5)*TS, y:(y+.5)*TS, got:false}); }
+  exit = {x:(W-1.5)*TS, y:(H-1.5)*TS};
+  const [ex,ey] = rndFloor(d0, 24);
+  E = {x:(ex+.5)*TS, y:(ey+.5)*TS, mode:'patrol', beat:0};
+  patrolMap = dmap(...rndFloor(d0, 0));
+  dP = dmap(1,1); lastPT = '';
+  grace = 6; time = 0; shake = 0; state = 'play';
+  say('Find ' + NEED + ' candle stubs. Do not run unless you must.', 5);
+}
+function say(t, s=3){ msg = t; msgT = s; }
+
+// ---------- enemy ----------
+function stepTo(e, dm, sp, dt){
+  const tx = e.x/TS|0, ty = e.y/TS|0, here = dm[ty][tx];
+  if(here <= 0) return true;
+  let best = null, bd = here;
+  for(const [a,b] of D){ const v = dm[ty+b] && dm[ty+b][tx+a]; if(v >= 0 && v < bd){ bd = v; best = [tx+a, ty+b]; } }
+  if(best){
+    const px = (best[0]+.5)*TS, py = (best[1]+.5)*TS, dx = px-e.x, dy = py-e.y, l = Math.hypot(dx,dy) || 1;
+    e.x += dx/l*sp*dt; e.y += dy/l*sp*dt;
+  }
+  return false;
+}
+function updateEnemy(dt){
+  const got = candles.filter(c => c.got).length;
+  const ex = E.x/TS|0, ey = E.y/TS|0, pd = dP[ey][ex];
+  const range = P.running ? 11 : P.moving ? 6 : 3;
+  if(grace <= 0){
+    if(E.mode === 'patrol' && pd >= 0 && pd <= range){ E.mode = 'chase'; tone(70, .6, .3, 'square'); }
+    else if(E.mode === 'chase' && (pd < 0 || pd > 13)) E.mode = 'patrol';
+  }
+  const dx = P.x-E.x, dy = P.y-E.y, dist = Math.hypot(dx,dy);
+  if(E.mode === 'chase'){
+    const sp = 130 + got*9;
+    if(stepTo(E, dP, sp, dt) || dist < TS*1.2){ E.x += dx/dist*sp*dt; E.y += dy/dist*sp*dt; }
+  } else if(grace <= 0){
+    if(stepTo(E, patrolMap, 70, dt)) patrolMap = dmap(...rndFloor(dmap(ex,ey), 0));
+  }
+  if(dist < 24 && grace <= 0){ state = 'dead'; deadT = 0; scream(); }
+  E.beat -= dt;
+  if(dist < TS*9 && E.beat <= 0){ tone(55, .15, .35); setTimeout(() => tone(48, .15, .25), 150); E.beat = .35 + dist/(TS*12); }
+  shake = Math.max(0, 1 - dist/(TS*5)) * 5;
+  if(drone) drone.forEach(g => g.gain.value = .025 + Math.max(0, 1 - dist/(TS*10)) * .05);
+}
+
+// ---------- update ----------
+function update(dt){
+  time += dt; grace -= dt; msgT -= dt;
+  let mx = 0, my = 0;
+  if(keys.KeyW || keys.ArrowUp) my--; if(keys.KeyS || keys.ArrowDown) my++;
+  if(keys.KeyA || keys.ArrowLeft) mx--; if(keys.KeyD || keys.ArrowRight) mx++;
+  P.moving = !!(mx || my);
+  P.running = P.moving && (keys.ShiftLeft || keys.ShiftRight) && !P.tired && P.stam > 0;
+  if(P.running) P.stam -= .33*dt; else P.stam = Math.min(1, P.stam + .18*dt);
+  if(P.stam <= 0) P.tired = true; if(P.tired && P.stam > .35) P.tired = false;
+  const sp = P.running ? 185 : 105, l = Math.hypot(mx,my) || 1;
+  const dx = mx/l*sp*dt, dy = my/l*sp*dt, r = P.r;
+  const free = (x,y) => !(solid(x-r,y-r) || solid(x+r,y-r) || solid(x-r,y+r) || solid(x+r,y+r));
+  if(free(P.x+dx, P.y)) P.x += dx;
+  if(free(P.x, P.y+dy)) P.y += dy;
+  P.oil = Math.max(0, P.oil - dt/110);
+
+  const pt = (P.x/TS|0) + ',' + (P.y/TS|0);
+  if(pt !== lastPT){ lastPT = pt; dP = dmap(P.x/TS|0, P.y/TS|0); }
+
+  for(const c of candles) if(!c.got && Math.hypot(c.x-P.x, c.y-P.y) < 24){
+    c.got = true; tone(660, .5, .2); tone(990, .7, .12);
+    const n = candles.filter(k => k.got).length;
+    say(n === NEED ? 'All candles found. The exit is open. RUN.' : 'Candle ' + n + ' of ' + NEED, 3);
+  }
+  for(const o of oils) if(!o.got && Math.hypot(o.x-P.x, o.y-P.y) < 24){
+    o.got = true; P.oil = Math.min(1, P.oil + .4); tone(330, .3, .15); say('Lantern oil refilled a little.', 2);
+  }
+  if(Math.hypot(exit.x-P.x, exit.y-P.y) < 30){
+    if(candles.every(c => c.got)){ state = 'win'; tone(523, 1, .3); tone(784, 1.4, .3); }
+    else say('The door will not open. You need all ' + NEED + ' candles.', 2);
+  }
+  updateEnemy(dt);
+}
+
+// ---------- draw ----------
+function draw(){
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, cw, ch);
+  const sx = (Math.random()-.5)*shake, sy = (Math.random()-.5)*shake;
+  const ox = cw/2 - P.x + sx, oy = ch/2 - P.y + sy;
+  ctx.save(); ctx.translate(ox, oy);
+  const x0 = Math.max(0, (P.x-cw/2)/TS|0), x1 = Math.min(W-1, (P.x+cw/2)/TS|0);
+  const y0 = Math.max(0, (P.y-ch/2)/TS|0), y1 = Math.min(H-1, (P.y+ch/2)/TS|0);
+  for(let y = y0; y <= y1; y++) for(let x = x0; x <= x1; x++){
+    const w = map[y][x] === 1, n = ((x*7 + y*13) % 5) * 3;
+    ctx.fillStyle = w ? `rgb(${70+n},${62+n},${58+n})` : `rgb(${32+n},${28+n},${26+n})`;
+    ctx.fillRect(x*TS, y*TS, TS, TS);
+    if(w){ ctx.fillStyle = 'rgba(0,0,0,.35)'; ctx.fillRect(x*TS, y*TS+TS-6, TS, 6); }
+  }
+  const allGot = candles.every(c => c.got);
+  ctx.fillStyle = allGot ? '#ffd24a' : '#3a2a14'; ctx.fillRect(exit.x-18, exit.y-18, 36, 36);
+  for(const c of candles) if(!c.got){
+    ctx.fillStyle = '#e8dcc0'; ctx.fillRect(c.x-4, c.y-2, 8, 12);
+    ctx.fillStyle = '#ffb030'; ctx.beginPath(); ctx.arc(c.x, c.y-6, 4, 0, 7); ctx.fill();
+  }
+  for(const o of oils) if(!o.got){ ctx.fillStyle = '#3a8fd0'; ctx.fillRect(o.x-6, o.y-8, 12, 16); }
+  const bob = Math.sin(time*6)*2;
+  ctx.fillStyle = '#050505'; ctx.fillRect(E.x-12, E.y-26+bob, 24, 44);
+  ctx.fillStyle = '#c9c4b5'; ctx.beginPath(); ctx.arc(E.x, E.y-32+bob, 11, 0, 7); ctx.fill();
+  ctx.fillStyle = '#000'; ctx.fillRect(E.x-6, E.y-36+bob, 4, 7); ctx.fillRect(E.x+2, E.y-36+bob, 4, 7);
+  ctx.fillStyle = '#8fa8c8'; ctx.beginPath(); ctx.arc(P.x, P.y, P.r, 0, 7); ctx.fill();
+  ctx.fillStyle = '#ffb030'; ctx.beginPath(); ctx.arc(P.x+8, P.y+4, 4, 0, 7); ctx.fill();
+  ctx.restore();
+
+  const flick = 1 + Math.sin(time*23)*.03 + (Math.random() < .03 ? -.18 : 0);
+  const rad = (50 + P.oil*210) * flick;
+  dctx.globalCompositeOperation = 'source-over'; dctx.fillStyle = 'rgba(0,0,0,.975)'; dctx.fillRect(0, 0, cw, ch);
+  dctx.globalCompositeOperation = 'destination-out';
+  const g = dctx.createRadialGradient(cw/2+sx, ch/2+sy, rad*.12, cw/2+sx, ch/2+sy, rad);
+  g.addColorStop(0, 'rgba(0,0,0,1)'); g.addColorStop(.55, 'rgba(0,0,0,.75)'); g.addColorStop(1, 'rgba(0,0,0,0)');
+  dctx.fillStyle = g; dctx.fillRect(0, 0, cw, ch);
+  ctx.drawImage(dk, 0, 0);
+
+  ctx.save(); ctx.translate(ox, oy);
+  for(const c of candles) if(!c.got && Math.hypot(c.x-P.x, c.y-P.y) < TS*9){
+    ctx.fillStyle = `rgba(255,170,50,${.35 + Math.sin(time*5 + c.x)*.15})`; ctx.beginPath(); ctx.arc(c.x, c.y-6, 3, 0, 7); ctx.fill();
+  }
+  if(Math.hypot(E.x-P.x, E.y-P.y) < TS*10){
+    ctx.fillStyle = '#ff1a1a'; ctx.fillRect(E.x-6, E.y-36+bob, 3, 3); ctx.fillRect(E.x+3, E.y-36+bob, 3, 3);
+  }
+  ctx.restore();
+  const near = Math.max(0, 1 - Math.hypot(E.x-P.x, E.y-P.y)/(TS*5));
+  if(near > 0){
+    const v = ctx.createRadialGradient(cw/2, ch/2, ch*.3, cw/2, ch/2, ch*.85);
+    v.addColorStop(0, 'rgba(120,0,0,0)'); v.addColorStop(1, `rgba(120,0,0,${near*.7})`);
+    ctx.fillStyle = v; ctx.fillRect(0, 0, cw, ch);
+  }
+  hud();
+}
+function hud(){
+  ctx.font = '20px Georgia'; ctx.fillStyle = '#d9c9a0'; ctx.textAlign = 'left';
+  ctx.fillText('Candles ' + candles.filter(c => c.got).length + ' / ' + NEED, 20, 32);
+  bar(20, 46, 'Oil', P.oil, '#3a8fd0'); bar(20, 72, 'Stamina', P.stam, P.tired ? '#a33' : '#6a9');
+  if(msgT > 0){ ctx.textAlign = 'center'; ctx.font = '26px Georgia'; ctx.fillStyle = '#fff'; ctx.fillText(msg, cw/2, ch*.15); }
+}
+function bar(x, y, label, v, col){
+  ctx.font = '14px Georgia'; ctx.fillStyle = '#999'; ctx.fillText(label, x, y+11);
+  ctx.fillStyle = '#222'; ctx.fillRect(x+60, y, 130, 12); ctx.fillStyle = col; ctx.fillRect(x+60, y, 130*Math.max(0, v), 12);
+}
+function screen(title, sub, col){
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, cw, ch); ctx.textAlign = 'center';
+  ctx.fillStyle = col; ctx.font = 'bold 72px Georgia'; ctx.fillText(title, cw/2, ch*.38);
+  ctx.fillStyle = '#bbb'; ctx.font = '22px Georgia';
+  sub.split('\n').forEach((s, i) => ctx.fillText(s, cw/2, ch*.5 + i*34));
+}
+function jumpscare(){
+  const s = 1 + Math.min(deadT, .6)*2.2;
+  ctx.fillStyle = deadT < .15 ? '#fff' : '#400'; ctx.fillRect(0, 0, cw, ch);
+  ctx.save(); ctx.translate(cw/2 + (Math.random()-.5)*20, ch/2 + (Math.random()-.5)*20); ctx.scale(s, s);
+  ctx.fillStyle = '#c9c4b5'; ctx.beginPath(); ctx.ellipse(0, 0, 90, 120, 0, 0, 7); ctx.fill();
+  ctx.fillStyle = '#000'; ctx.fillRect(-50, -40, 30, 50); ctx.fillRect(20, -40, 30, 50);
+  ctx.beginPath(); ctx.ellipse(0, 60, 35, 25, 0, 0, 7); ctx.fill();
+  ctx.fillStyle = '#f00'; ctx.fillRect(-38, -20, 6, 6); ctx.fillRect(32, -20, 6, 6);
+  ctx.restore();
+}
+
+// ---------- loop ----------
+let last = 0;
+function loop(now){
+  requestAnimationFrame(loop);
+  const dt = Math.min(.05, (now - last)/1000); last = now;
+  if(state === 'title') screen('LAST WICK', 'Five candle stubs are scattered through the crypt.\nCollect them all and reach the door. Something hears you run.\n\nWASD / Arrows move  |  Shift run  |  Press ENTER to begin', '#c22');
+  else if(state === 'play'){ update(dt); if(state === 'play') draw(); }
+  else if(state === 'dead'){
+    deadT += dt;
+    if(deadT < 1.3) jumpscare();
+    else screen('YOU WERE TAKEN', 'The wick goes out.\n\nPress ENTER to try again', '#a00');
+  }
+  else if(state === 'win') screen('YOU ESCAPED', 'Dawn. The crypt is silent... for now.\n\nPress ENTER to play again', '#e8c34a');
+}
+addEventListener('keydown', e => {
+  keys[e.code] = true;
+  if(['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Space'].includes(e.code)) e.preventDefault();
+  if(e.code === 'Enter' && state !== 'play' && !(state === 'dead' && deadT < 1.3)){ initAudio(); newGame(); }
+});
+addEventListener('keyup', e => keys[e.code] = false);
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
+
+
+
+
+whd hsdhfj aws hcfg dsh fhrhd, so what is it happening?
+
+
+<!doctype html>
+okay, let us discuss today, okay, are you sure?
